@@ -1,0 +1,205 @@
+# Install TensorFlow
+tensorflow::install_tensorflow()
+
+library(dplyr)
+library(tidyverse)
+
+if (!require("readr")) {
+  install.packages("readr")
+  library(readr)
+}
+
+if (!require("aws.s3")) {
+  install.packages("aws.s3")
+  library(aws.s3)
+}
+
+if (!require("h2o")) {
+  install.packages("h2o")
+  library(h2o)
+}
+
+library(aws.s3)
+
+# set the credentials this r instances uses to access minio
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = "minioadmin",
+  "AWS_SECRET_ACCESS_KEY" = "minioadmin",
+  "AWS_DEFAULT_REGION" = "",
+  "AWS_S3_ENDPOINT" = "localhost:9000")  
+
+# get the bucket - read the csv files from the minio cluster
+b <- get_bucket(bucket = "citicard", use_https = F, region = "")
+
+# get the bucket - read the csv files from the minio cluster
+c <- get_bucket(bucket = "citicardcredit", use_https = F, region = "")
+
+str(b)
+summary(b)
+# get the object from the bucket
+file_obj <- get_object(object = "Citibank 2022-1.csv", bucket = "citicard", use_https = F, region = "")
+
+# read the csv data from the object
+b <- read.csv(text = rawToChar(file_obj))
+
+# get the object from the second bucket
+file_obj_c <- get_object(object = "Last year (2022) (2).CSV", bucket = "citicardcredit", use_https = F, region = "")
+
+# read the csv data from the object
+c <- read.csv(text = rawToChar(file_obj_c))
+
+# Assuming your data are loaded into variables `b` and `c`
+# b - Quickbooks data
+# c - Citicard data
+
+# Convert the date and transaction amount fields to the proper format
+b$Date <- as.Date(b$Date, "%m/%d/%Y")
+b$Amount <- as.numeric(gsub(',', '', b$Amount))  # remove commas and convert to numeric
+
+c$Date <- as.Date(c$Date, "%m/%d/%Y")
+c$Debit <- as.numeric(gsub(',', '', c$Debit))  # remove commas and convert to numeric
+c$Credit <- as.numeric(gsub(',', '', c$Credit))  # remove commas and convert to numeric
+
+# Combine Debit and Credit transactions into a single column
+c$Transaction <- ifelse(is.na(c$Debit), c$Credit, c$Debit)
+
+
+
+match_transactions <- function(b, c) {
+  # Start with an empty dataframe for the results
+  result <- data.frame()
+ 
+  # Loop over each row in b
+  for (i in 1:nrow(b)) {
+    # Get the transaction from b
+    transaction1 <- b[i, ]
+   
+    # Find matches in c based on the amount
+    matches <- c[which(c$Transaction == transaction1$Amount), ]
+   
+    # If there are matches
+    if (nrow(matches) >= 1) {
+      # If there are multiple matches
+      if (nrow(matches) > 1) {
+        # Find the match with the closest date
+        dates <- as.Date(matches$Date)
+        target_date <- as.Date(transaction1$Date)
+        min_date_diff_index <- which.min(abs(dates - target_date))
+        best_match <- matches[min_date_diff_index, ]
+      } else {
+        # If there's only one match, use it
+        best_match <- matches
+      }
+     
+      # Add the best match to the result dataframe
+      result <- rbind(result, cbind(transaction1, best_match))
+    }
+  }
+ 
+  # Return the matched transactions
+  return(result)
+}
+
+# Use the function
+matched_transactions <- match_transactions(b, c)
+
+library(keras)
+library(text)
+
+if (!require("keras")) {
+  install.packages("keras")
+  library(keras)
+}
+
+if (!require("text")) {
+  install.packages("text")
+  library(text)
+}
+
+if (!require("magrittr")) {
+  install.packages("magrittr")
+}
+
+library(magrittr)
+
+if (!require("recipes")) {
+  install.packages("recipes")
+}
+
+library(recipes)
+
+# Check the python version used by R
+reticulate::py_config()
+
+# Install TensorFlow
+#tensorflow::install_tensorflow()
+
+# Verify TensorFlow installation
+reticulate::py_module_available('tensorflow')
+
+tensorflow::tf_config()
+
+# Initialize tokenizer
+tokenizer <- text_tokenizer(num_words = 10000)
+
+# Fit tokenizer on your text data
+tokenizer %>% fit_text_tokenizer(matched_transactions$Description)
+
+# Convert your text data to sequences
+text_sequences <- texts_to_sequences(tokenizer, matched_transactions$Description)
+
+padded_sequences <- pad_sequences(text_sequences)
+
+
+# Define the proportion of data you want to assign to the training set (e.g., 80%)
+train_prop <- 0.8
+
+# Get the indices for the training set
+train_indices <- sample(1:nrow(matched_transactions), size = floor(train_prop * nrow(matched_transactions)))
+
+# Split the data into training and validation sets
+train_data <- padded_sequences[train_indices, ]
+valid_data <- padded_sequences[-train_indices, ]
+
+# Convert the target variables to one-hot encoding
+train_labels_split <- to_categorical(as.integer(factor(matched_transactions$Split[train_indices])))
+valid_labels_split <- to_categorical(as.integer(factor(matched_transactions$Split[-train_indices])))
+
+train_labels_name <- to_categorical(as.integer(factor(matched_transactions$Name[train_indices])))
+valid_labels_name <- to_categorical(as.integer(factor(matched_transactions$Name[-train_indices])))
+
+# Define the input layer
+inputs <- layer_input(shape = c(ncol(train_data)))
+
+# Define the hidden layers
+x <- inputs %>%
+  layer_dense(units = 256, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 128, activation = 'relu') %>%
+  layer_dropout(rate = 0.5)
+
+# Define the output layers
+output_split <- x %>%
+  layer_dense(units = ncol(train_labels_split), activation = 'softmax', name = 'output_split')
+output_name <- x %>%
+  layer_dense(units = ncol(train_labels_name), activation = 'softmax', name = 'output_name')
+
+# Create the model
+model <- keras_model(inputs = inputs, outputs = c(output_split, output_name))
+
+# Compile the model
+model %>% compile(
+  optimizer = 'adam',
+  loss = list(output_split = 'categorical_crossentropy', output_name = 'categorical_crossentropy'),
+  loss_weights = list(output_split = 1, output_name = 1),
+  metrics = list(output_split = 'accuracy', output_name = 'accuracy')
+)
+
+# Train the model
+history <- model %>% fit(
+  x = train_data,
+  y = list(output_split = train_labels_split, output_name = train_labels_name),
+  validation_data = list(valid_data, list(output_split = valid_labels_split, output_name = valid_labels_name)),
+  epochs = 20,
+  batch_size = 32
+)
